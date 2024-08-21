@@ -16,21 +16,27 @@
 
 import { Config } from '@backstage/config';
 import { InputError } from '@backstage/errors';
-import { Logger } from 'winston';
+import {
+  LoggerService,
+  readSchedulerServiceTaskScheduleDefinitionFromConfig,
+  SchedulerService,
+  SchedulerServiceTaskRunner,
+  SchedulerServiceTaskScheduleDefinition,
+  SchedulerServiceTaskScheduleDefinitionConfig,
+} from '@backstage/backend-plugin-api';
 import express from 'express';
 import Router from 'express-promise-router';
 import { VaultApi, VaultClient } from './vaultApi';
-import { TaskRunner, PluginTaskScheduler } from '@backstage/backend-tasks';
-import { errorHandler } from '@backstage/backend-common';
+import { MiddlewareFactory } from '@backstage/backend-defaults/rootHttpRouter';
 
 /**
  * Environment values needed by the VaultBuilder
  * @public
  */
 export interface VaultEnvironment {
-  logger: Logger;
+  logger: LoggerService;
   config: Config;
-  scheduler: PluginTaskScheduler;
+  scheduler: SchedulerService;
 }
 
 /**
@@ -80,6 +86,12 @@ export class VaultBuilder {
       };
     }
 
+    if (config.has('vault.token')) {
+      logger.warn(
+        "The 'vault.token' configuration has been deprecated, use 'vault.auth' instead",
+      );
+    }
+
     this.vaultApi = this.vaultApi ?? new VaultClient(this.env);
 
     const router = this.buildRouter(this.vaultApi);
@@ -101,18 +113,28 @@ export class VaultBuilder {
   }
 
   /**
-   * Enables the token renewal for Vault.
+   * Enables the token renewal for Vault. The schedule if configured in the app-config.yaml file.
+   * If not set, the renewal is executed hourly.
    *
-   * @param schedule - The TaskRunner used to schedule the renewal, if not set, renewing hourly
+   * The token renewal is only needed for the static secret authentication.
+   *
    * @returns
    */
-  public async enableTokenRenew(schedule?: TaskRunner) {
+  public async enableTokenRenew(schedule?: SchedulerServiceTaskRunner) {
+    if (
+      this.env.config.has('vault.auth') && // FIXME: Needed to allow retro-compatibility to work. Remove in future release
+      this.env.config.getString('vault.auth.type') === 'kubernetes'
+    ) {
+      this.env.logger.warn(
+        'Token renewal not supported for Kubernetes authentication',
+      );
+      return this;
+    }
+
     const taskRunner = schedule
       ? schedule
-      : this.env.scheduler.createScheduledTaskRunner({
-          frequency: { hours: 1 },
-          timeout: { hours: 1 },
-        });
+      : this.env.scheduler.createScheduledTaskRunner(this.getConfigSchedule());
+
     await taskRunner.run({
       id: 'refresh-vault-token',
       fn: async () => {
@@ -122,6 +144,24 @@ export class VaultBuilder {
       },
     });
     return this;
+  }
+
+  private getConfigSchedule(): SchedulerServiceTaskScheduleDefinition {
+    const schedule = this.env.config.getOptional<
+      SchedulerServiceTaskScheduleDefinitionConfig | boolean
+    >('vault.schedule');
+
+    const scheduleCfg =
+      schedule !== undefined && schedule !== false
+        ? {
+            frequency: { hours: 1 },
+            timeout: { hours: 1 },
+          }
+        : readSchedulerServiceTaskScheduleDefinitionFromConfig(
+            this.env.config.getConfig('vault.schedule'),
+          );
+
+    return scheduleCfg;
   }
 
   /**
@@ -155,7 +195,7 @@ export class VaultBuilder {
       res.json({ items: secrets });
     });
 
-    router.use(errorHandler());
+    router.use(MiddlewareFactory.create(this.env).error());
     return router;
   }
 }
